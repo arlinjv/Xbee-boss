@@ -3,7 +3,7 @@
 
 #The purpose of this script is to process and print out all data coming in to the 
 #attached coordinator xbee in api mode. 
-# This script is intended to be run with interactive mode from a terminal: python -i XbeeBoss.py
+# This script is intended to be run in interactive mode from a terminal: python -i XbeeBoss.py
 # python-xbee package installed at /usr/local/lib/python2.7/dist-packages/xbee
 
 # First git commit done on 2/22/2015
@@ -20,18 +20,23 @@ import time
 import sys
 from xbee import XBee,ZigBee
 import pprint
-import xbeeDB
-# import threads # moving thread functions to separate module kept leading to global name errors
+import xbeeDB #another python file stored in same directory
+from collections import deque
 
 #setup --------------------------------------------
 
+# Modified in receive_data():
+msg_queue = deque() #create empty deque to hold incoming messages (deque is a container object. short for double ended queue)
+msg_count = 0
+
+# Modified in process_msg_queue():
 last_data = {} # gets value in print_data()
 last_rx_node = {'addr_long':None,'addr':None, 'node_identifier':None}
 nodes = [] # will become list of node dicts ( {'node_identifier', 'addr', 'addr_long', 'parent_address'} )
+
 BC_LONG = '\x00\x00\x00\x00\x00\x00\xFF\xFF' #broadcast long addr. bc short addr is usually set as default
 
 config = ConfigObj('config.ini', encoding = 'UTF8')
-
 connectDB = config['connectDB'] # check the config.ini file to see if db should be connected to or not
 
 minimum_poll_interval = 5
@@ -98,14 +103,14 @@ def msg(msg_data = None, node = None): #typical use will be to specify a node li
 def rss():
 	print "signal strength testing beginning ....."
 
-	def RSS_scanner(nodes):
+	def RSS_scanner(nodes): #nodes here is a copy of the global nodes list
 		time_limit = 5.0
 		t = time.time()
 		nodes.append({}) # need an extra dict for the coordinator response
 		output = [] # fill with responses and print before closing
 		
 		while len(nodes) > 0:
-			if last_data.get('command') == 'DB':
+			if last_data.get('command') == 'DB': #check to see if there is a response pending to DB command
 				for node in nodes:
 					if node.get('addr_long') == last_data.get('source_addr_long'): #in case of coordinator None and None will match
 						if node.get('addr_long') == None: #must be the coordinator
@@ -149,10 +154,106 @@ def populate_devices(node):
 	pass
 	# query node for its devices and put corresponding entries in db
 	# call after doing node discovery
+
 	
-#  <<<<<<<<<<<<<<<<<<<<< Thread functions >>>>>>>>>>>>>>>>>>>>>>>
+#  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< Thread functions >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
 def list_threads():
 	return threading.enumerate()
+	
+def initiate_msg_queue_monitoring():
+	# launch a msg queue monitoring thread 
+	
+	def process_msg_queue():
+
+		# To be launched from initiate_msg_queue_monitoring() as a worker thread
+		# goes through msq_queue and dispatches responses as needed
+		# this will involve a popleft() to take oldest message off the queue
+		# decided to use deque because fast at both ends and 'threadsafe' (poplefts are atomic operations)
+		# many msgs will be discards (like {'status': '\x00', 'id': 'status'} )
+		# Below tasks were formerly done in receive_data
+
+		print threading.current_thread()._Thread__name, "thread has been launched"
+		
+		while True:
+			# monitor length of msg_queue - curious if it will ever get longer than one or two items - test by spamming
+			if len(msg_queue) > 2:
+				print "msg queue length = ", len(msg_queue)
+			
+			if len(msg_queue) > 0: #can't pop from an empty deque
+				
+				global msg_count
+				msg_count +=1
+				
+				data = msg_queue.popleft()
+				
+				global last_data
+				last_data = dict.copy(data) #this makes data available from interactive shell
+				
+				if ('command' in data and data['command'] == 'ND'): 
+					#data received is a result of a node discovery
+					node = dict()
+					parameters = data.get('parameter', {'node_identifier': None, 'source_addr': None, 'source_addr_long': None, 'parent_address': None}) 
+					#dict after comma in .get() above is default value
+					node['addr'] = parameters.get('source_addr')
+					node['addr_long'] = parameters.get('source_addr_long')
+					node['node_identifier'] = parameters.get('node_identifier')
+					node['parent_address'] = parameters.get('parent_address')
+					nodes.append(node) # no danger of duplicates because nodes is cleared when node_discovery() called
+					print "Node added to nodes list. "
+					
+					global connectDB
+					if connectDB == 'True':
+						xbeeDB.update_node(node) # will add node to DB if new and ignore duplicates
+
+				if 'id' in data and 'rx' in data['id']: # catches rx and rx_explicit msgs (e.g. when node rejoins, rf_data or io data recvd)
+					global last_rx_node # for use in msg_reply()
+					last_rx_node['addr'] = data.get('source_addr')
+					last_rx_node['addr_long'] = data.get('source_addr_long')
+					
+					if 'rf_data' in data:
+						try:
+							rf = json.loads(data['rf_data']) #check for json formatted message
+							
+							if 'devices' in rf.keys(): # this could occur as a result of something like this: msg('devices')
+													   # be aware that calling msg('devices') more than once will result in an error message
+								devices = rf['devices'] #should return a list of strings with names of devices
+								for device in devices: # add devices in list to devices table
+									try:
+										xbeeDB.new_device(device_id = device, parent_node = last_data['source_addr_long'].encode('hex'))
+									except Exception, e:
+										print device, " already exists in device table." #
+										
+							elif 'device' in rf.keys(): # must be elif because of overlap in key words ( device(s) )
+								# typical rf_data from smart node would be like -  'rf_data': '{"device":"thermo1","msgtype":"poll","data":"21.37"}'
+								
+								if rf['msgtype'] == 'poll':
+									# device monitor thread will capture any changes in data vals and launch a poller thread if polling enabled
+									xbeeDB.update_device(device_id = rf['device'], parent_node = last_data['source_addr_long'].encode('hex'), last_val = rf['data'])
+								
+								if rf['msgtype'] == 'alarm':
+									print "alarm message received"
+									# replace this with something better. problem is each call will result in a new window
+									# if using subprocess, maybe have a list of subprocesses opening each one as 'p = subprocess.Popen(args)'
+									# then I can check the list and see if window already exists and kill it if desired
+									subprocess.Popen(["python", "./alarms/Alarm_Window.py", "-d 4"], shell = False) # doing this appears to take between 3 and 6 millis
+										
+									
+						except ValueError, e: # e == No JSON object could be decoded
+							print "non json data received (", e, ")"
+							print "rf_data received: ", data['rf_data'] # untested code. added during rework
+							# rf_data from rx_explicits where node rejoins mesh can be caught here - use to update node list and db
+			
+					#To do: Implement the following catchers:
+					# - io data
+					# - alarm messages (implement in arduino code by setting msgtype = 'alarm')
+					# - optional: log incoming messages in a db or file
+					# currently trigger code in new_device_table catches all changes in data field. not sure if that will be optimal or not. 
+			
+
+	t = threading.Thread(target = process_msg_queue, name = "msg queue monitor")
+	t.start()
+
 
 def initiate_keep_alive(): #keep nodes active by periodically issuing ND command
 	
@@ -187,9 +288,9 @@ def initiate_device_monitoring():
 				match = old_device
 		return match
 	
-	def launch_poller(device): # called as target of device monitoring thread. launches additional polling device polling threads
+	def launch_poller(device): # called as target of device monitoring thread. launches additional device polling threads
 		
-		def poller(device): 
+		def poller(device): # poll device periodically based on poll_interval
 			
 			# To do: check to see whether parent node is in network 
 			
@@ -203,7 +304,7 @@ def initiate_device_monitoring():
 				device_list = xbeeDB.list_devices()
 				device = find_match(device, device_list)
 				
-				if device['poll'] != 'True': #exit from loop in order to let thread die
+				if device['poll'] != 'True': # exit from loop in order to let thread die
 					break
 					
 				if int(device['poll_interval']) <= minimum_poll_interval: 
@@ -222,8 +323,10 @@ def initiate_device_monitoring():
 			# we've left the while loop so go ahead and exit
 			print threading.current_thread()._Thread__name, " thread exiting"
 			time.sleep(2) # give print statements time to complete
-			
+		
+		# launch poller thread to send poll msgs to device at poll_interval interval:
 		t = threading.Thread(target = poller, args = (device,), name = device['device_id']) #To do: improve thread name
+		#t.daemon = True # new code - not sure how this will affect interactive mode so implement later, but seems like a good idea
 		t.start()
 		print "device poller thread launched for ", device['device_id'], " (node = ", device['parent_node'],")"
 			
@@ -302,71 +405,24 @@ def receive_data(data):
 	from the associated XBee device. Its first and
 	only argument is the data contained within the
 	frame.
-	"""
-	t0 = time.time()
-	global last_data
-	last_data = dict.copy(data) #this makes data available from interactive shell
-	
-	pprint.pprint(data)
-	
-	if ('command' in data and data['command'] == 'ND'): 
-		#data received is a result of a node discovery
-		node = dict()
-		parameters = data.get('parameter', {'node_identifier': None, 'source_addr': None, 'source_addr_long': None, 'parent_address': None}) 
-		#dict after comma in .get() above is default value
-		node['addr'] = parameters.get('source_addr')
-		node['addr_long'] = parameters.get('source_addr_long')
-		node['node_identifier'] = parameters.get('node_identifier')
-		node['parent_address'] = parameters.get('parent_address')
-		nodes.append(node) # no danger of duplicates because nodes is cleared when node_discovery() called
-		print "Node added to nodes list. "
-		
-		global connectDB
-		if connectDB == 'True':
-			xbeeDB.update_node(node) # will add node to DB if new and ignore duplicates
-			
-		
-	if 'id' in data and 'rx' in data['id']: # catches rx and rx_explicit msgs (e.g. when node rejoins, rf_data or io data recvd)
-		global last_rx_node # for use in msg_reply()
-		last_rx_node['addr'] = data.get('source_addr')
-		last_rx_node['addr_long'] = data.get('source_addr_long')
-		
-		if 'rf_data' in data:
-			try:
-				rf = json.loads(data['rf_data']) #check for json formatted message
-				
-				if 'devices' in rf.keys(): # this could occur as a result of something like this: msg('devices')
-										   # be aware that calling msg('devices') more than once will result in an error message
-					devices = rf['devices'] #should return a list of strings with names of devices
-					for device in devices: # add devices in list to devices table
-						try:
-							xbeeDB.new_device(device_id = device, parent_node = last_data['source_addr_long'].encode('hex'))
-						except Exception, e:
-							print device, " already exists in device table." #
-							
-				elif 'device' in rf.keys(): # must be elif because of overlap in key words ( device(s) )
-					# typical rf_data from smart node would be like -  'rf_data': '{"device":"thermo1","msgtype":"poll","data":"21.37"}'
-					
-					if rf['msgtype'] == 'poll':
-						# device monitor thread will capture any changes in data vals and launch a poller thread if polling enabled
-						xbeeDB.update_device(device_id = rf['device'], parent_node = last_data['source_addr_long'].encode('hex'), last_val = rf['data'])
-					
-					if rf['msgtype'] == 'alarm':
-						print "alarm message received"
-						# replace this with something better. problem is each call will result in a new window
-						# if using subprocess, maybe have a list of subprocesses opening each one as 'p = subprocess.Popen(args)'
-						# then I can check the list and see if window already exists and kill it if desired
-						subprocess.Popen(["python", "./alarms/Alarm_Window.py", "-d 4"], shell = False) # doing this appears to take between 3 and 6 millis
-							
-						
-			except ValueError, e: # e == No JSON object could be decoded
-				print "non json data received: ", e
-				# rf_data from rx_explicits where node rejoins mesh can be caught here - use to update node list and db
 
-		#To do: Implement the following catchers:
-		# - io data
-		# - alarm messages (implement in arduino code by setting msgtype = 'alarm')
-		# currently trigger code in new_device_table catches all changes in data field. not sure if that will be optimal or not. 
+	purpose of receive_data is to take incoming data and add it to a queue or queues
+	to be processed elsewhere. 
+	only exception is to print incoming data and maybe have a logging function to save incoming data directly to a text file
+	"""
+	
+	
+	t0 = time.time()	
+	
+	if pprint.isreadable(data): #not sure if every message has been getting printed
+		pprint.pprint(data)
+	else:
+		print "couldn't pretty print. here is raw data:"
+		print(data)
+		
+	
+	global msg_queue
+	msg_queue.append(data) #process incoming messages in a separate thread
 	
 	t1 = time.time()
 	print t1 - t0
@@ -407,6 +463,7 @@ def main():
 	
 	node_discovery()
 	initiate_device_monitoring()
+	initiate_msg_queue_monitoring()
 
 if __name__ == '__main__':
     main()
